@@ -1,0 +1,30 @@
+{
+  "name": "cortexpool",
+  "version": "0.1.0",
+  "description": "Graph-based memory system with relevance pooling for AI assistants",
+  "main": "dist/cortex-pool.js",
+  "types": "dist/cortex-pool.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "seed": "tsx scripts/seed.ts",
+    "test": "echo \"Tests not implemented yet\" && exit 0"
+  },
+  "keywords": [
+    "memory",
+    "graph",
+    "ai",
+    "context",
+    "cognition"
+  ],
+  "author": "Aaron",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}

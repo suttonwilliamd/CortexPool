@@ -1,0 +1,28 @@
+Improve the CortexPool memory system in src/cortex-pool.ts with these enhancements:
+
+1. **Better Entity Resolution**
+   - Add fuzzy matching using Levenshtein distance
+   - Add co-reference tracking (resolving "he", "it", "the project" to actual entities)
+   - Add entity merging suggestions
+
+2. **Vector Embedding Integration**
+   - Add placeholder interface for vector search
+   - Add method to get embedding for a query
+   - Implement hybrid retrieval (merge graph + vector results)
+
+3. **Improved Activation Spreading**
+   - Add attenuation by edge distance
+   - Add activation decay over time
+   - Track activation history
+
+4. **Memory Compression**
+   - Add summarization placeholder during reflection
+   - Merge similar facts
+   - Prune redundant edges
+
+5. **TTL for Episodic**
+   - Add explicit TTL field to episodic memories
+   - Auto-expire old episodic facts
+   - Add cleanup method
+
+Keep all existing functionality. The file is at src/cortex-pool.ts. Output the improved file.
