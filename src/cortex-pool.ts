@@ -25,6 +25,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import http from 'http';
 
 export type MemoryTier = 'episodic' | 'semantic' | 'structural';
 export type PredicateType = 
@@ -113,11 +114,89 @@ export class CortexPool {
   private coReferences: Map<string, CoReferenceEntry> = new Map();
   private maxActivationHistory: number = 1000;
   
-  constructor(dbPath: string) {
+  constructor(dbPath: string, private tpcUrl: string = 'http://localhost:3000') {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     this.db = new Database(dbPath);
     this.init();
+  }
+
+  // ===== TPC Server Sync =====
+
+  private async httpRequest(method: string, path: string, body?: object): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const url = new URL(path, this.tpcUrl);
+      const options = {
+        hostname: url.hostname,
+        port: url.port || 80,
+        path: url.pathname + url.search,
+        method,
+        headers: { 'Content-Type': 'application/json' }
+      };
+
+      const req = http.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            resolve(data ? JSON.parse(data) : null);
+          } catch {
+            resolve(data);
+          }
+        });
+      });
+
+      req.on('error', reject);
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
+  }
+
+  async syncFactToTPC(fact: { content: string; subject: string; predicate: string; tier: string }) {
+    try {
+      const tags = ['cortexpool', fact.tier, fact.predicate];
+      await this.httpRequest('POST', '/thoughts', {
+        content: `[${fact.subject} ${fact.predicate}] ${fact.content}`,
+        tags
+      });
+    } catch (err) {
+      console.error('Failed to sync fact to TPC:', err);
+    }
+  }
+
+  async syncToTPC(): Promise<{ synced: number; failed: number }> {
+    const facts = this.db.prepare(`
+      SELECT f.*, e.name as subjectName 
+      FROM facts f 
+      JOIN entities e ON f.subjectId = e.id 
+      WHERE f.createdAt > ?
+    `).all(Date.now() - 24 * 60 * 60 * 1000) as any[];
+
+    let synced = 0, failed = 0;
+    for (const fact of facts) {
+      try {
+        await this.syncFactToTPC({
+          content: fact.content,
+          subject: fact.subjectName,
+          predicate: fact.predicate,
+          tier: fact.tier
+        });
+        synced++;
+      } catch {
+        failed++;
+      }
+    }
+    return { synced, failed };
+  }
+
+  async fetchFromTPC(query: string, limit: number = 10): Promise<any[]> {
+    try {
+      const result = await this.httpRequest('GET', `/search?q=${encodeURIComponent(query)}&type=thoughts&limit=${limit}`);
+      return result || [];
+    } catch (err) {
+      console.error('Failed to fetch from TPC:', err);
+      return [];
+    }
   }
 
   private init() {
@@ -406,7 +485,9 @@ export class CortexPool {
       for (const result of graphResults) {
         const vectorScore = vectorFactIds.get(result.id) || 0;
         const combinedScore = result.score * 0.7 + vectorScore * 0.3;
-        mergedResults.set(result.id, { ...result, score: combinedScore });
+        // result already has Fact fields + subject/object/score - just update score
+        (result as any).score = combinedScore;
+        mergedResults.set(result.id, result as any);
       }
 
       for (const [factId, vectorScore] of vectorFactIds) {
@@ -416,18 +497,18 @@ export class CortexPool {
             const subject = this.db.prepare('SELECT * FROM entities WHERE id = ?').get(fact.subjectId) as any;
             const object = fact.objectId ? this.db.prepare('SELECT * FROM entities WHERE id = ?').get(fact.objectId) as any : null;
             mergedResults.set(factId, {
-              ...fact,
+              fact,
               subject: this.hydrateEntity(subject),
               object: object ? this.hydrateEntity(object) : null,
               score: vectorScore * 0.3
-            });
+            } as any);
           }
         }
       }
 
       return Array.from(mergedResults.values())
         .sort((a, b) => b.score - a.score)
-        .slice(0, poolSize);
+        .slice(0, poolSize) as any;
     } catch {
       return graphResults;
     }
