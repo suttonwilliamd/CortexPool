@@ -190,12 +190,20 @@ export class CortexPool {
   }
 
   async fetchFromTPC(query: string, limit: number = 10): Promise<any[]> {
+    const encodedQuery = encodeURIComponent(query);
+
     try {
-      const result = await this.httpRequest('GET', `/search?q=${encodeURIComponent(query)}&type=thought&limit=${limit}`);
-      return result || [];
+      const result = await this.httpRequest('GET', `/search?q=${encodedQuery}&type=thought&limit=${limit}`);
+      return Array.isArray(result) ? result : [];
     } catch (err) {
-      console.error('Failed to fetch from TPC:', err);
-      return [];
+      try {
+        const fallbackResult = await this.httpRequest('GET', `/search?q=${encodedQuery}&type=thoughts&limit=${limit}`);
+        return Array.isArray(fallbackResult) ? fallbackResult : [];
+      } catch (fallbackErr) {
+        console.error('Failed to fetch from TPC:', err);
+        console.error('Failed fallback fetch from TPC:', fallbackErr);
+        return [];
+      }
     }
   }
 
