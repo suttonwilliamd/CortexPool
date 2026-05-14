@@ -191,7 +191,7 @@ export class CortexPool {
 
   async fetchFromTPC(query: string, limit: number = 10): Promise<any[]> {
     try {
-      const result = await this.httpRequest('GET', `/search?q=${encodeURIComponent(query)}&type=thoughts&limit=${limit}`);
+      const result = await this.httpRequest('GET', `/search?q=${encodeURIComponent(query)}&type=thought&limit=${limit}`);
       return result || [];
     } catch (err) {
       console.error('Failed to fetch from TPC:', err);
@@ -359,11 +359,22 @@ export class CortexPool {
     const normalizedPronoun = pronoun.toLowerCase().trim();
     const now = Date.now();
 
-    this.db.prepare(`
-      INSERT INTO co_references (pronoun, entityId, context, lastSeen)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(pronoun) DO UPDATE SET entityId = ?, context = ?, lastSeen = ?
-    `).run(normalizedPronoun, entityId, context, now, entityId, context, now);
+    const existing = this.db.prepare(`
+      SELECT id FROM co_references WHERE pronoun = ? LIMIT 1
+    `).get(normalizedPronoun) as { id: number } | undefined;
+
+    if (existing) {
+      this.db.prepare(`
+        UPDATE co_references
+        SET entityId = ?, context = ?, lastSeen = ?
+        WHERE id = ?
+      `).run(entityId, context, now, existing.id);
+    } else {
+      this.db.prepare(`
+        INSERT INTO co_references (pronoun, entityId, context, lastSeen)
+        VALUES (?, ?, ?, ?)
+      `).run(normalizedPronoun, entityId, context, now);
+    }
 
     this.coReferences.set(normalizedPronoun, {
       pronoun: normalizedPronoun,
