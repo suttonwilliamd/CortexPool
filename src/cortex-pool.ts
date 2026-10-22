@@ -26,6 +26,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 
 export type MemoryTier = 'episodic' | 'semantic' | 'structural';
 export type PredicateType = 
@@ -126,18 +127,23 @@ export class CortexPool {
   private async httpRequest(method: string, path: string, body?: object): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.tpcUrl);
-      const options = {
-        hostname: url.hostname,
-        port: url.port || 80,
-        path: url.pathname + url.search,
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        reject(new Error(`Unsupported TPC protocol: ${url.protocol}`));
+        return;
+      }
+      const transport = url.protocol === 'https:' ? https : http;
+      const req = transport.request(url, {
         method,
         headers: { 'Content-Type': 'application/json' }
-      };
-
-      const req = http.request(options, (res) => {
+      }, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
+        res.on('error', reject);
         res.on('end', () => {
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`TPC ${method} ${url.pathname} failed with HTTP ${res.statusCode}`));
+            return;
+          }
           try {
             resolve(data ? JSON.parse(data) : null);
           } catch {
@@ -146,6 +152,7 @@ export class CortexPool {
         });
       });
 
+      req.setTimeout(10_000, () => req.destroy(new Error('TPC request timed out')));
       req.on('error', reject);
       if (body) req.write(JSON.stringify(body));
       req.end();
@@ -160,11 +167,12 @@ export class CortexPool {
         tags
       });
     } catch (err) {
-      console.error('Failed to sync fact to TPC:', err);
+      throw new Error('Failed to sync fact to TPC', { cause: err });
     }
   }
 
   async syncToTPC(): Promise<{ synced: number; failed: number }> {
+    this.cleanupExpiredEpisodic();
     const facts = this.db.prepare(`
       SELECT f.*, e.name as subjectName 
       FROM facts f 
@@ -535,7 +543,7 @@ export class CortexPool {
 
   // ===== Improved Activation Spreading =====
 
-  private async spreadActivation(depth: number = 2, decay: number = 0.5) {
+  private spreadActivation(depth: number = 2, decay: number = 0.5) {
     const now = Date.now();
 
     for (let d = 0; d < depth; d++) {
@@ -594,14 +602,10 @@ export class CortexPool {
   private recordActivationHistory() {
     const now = Date.now();
     
-    for (const [entityId, activation] of this.activationLevels) {
-      this.activationHistory.push({
-        entityId,
-        activation,
-        timestamp: now,
-        source: 'spread'
-      });
-    }
+    const entries = Array.from(this.activationLevels, ([entityId, activation]) => ({
+      entityId, activation, timestamp: now, source: 'spread'
+    }));
+    this.activationHistory.push(...entries);
 
     if (this.activationHistory.length > this.maxActivationHistory) {
       this.activationHistory = this.activationHistory.slice(-this.maxActivationHistory);
@@ -612,7 +616,7 @@ export class CortexPool {
       VALUES (?, ?, ?, ?)
     `);
     
-    for (const entry of this.activationHistory.slice(-100)) {
+    for (const entry of entries) {
       stmt.run(entry.entityId, entry.activation, entry.source, entry.timestamp);
     }
   }
@@ -644,7 +648,8 @@ export class CortexPool {
         const f1 = facts[i];
         const f2 = facts[j];
 
-        if (f1.subjectId !== f2.subjectId || f1.predicate !== f2.predicate) continue;
+        if (!this.getFact(f1.id) || !this.getFact(f2.id)) continue;
+        if (f1.subjectId !== f2.subjectId || f1.predicate !== f2.predicate || f1.objectId !== f2.objectId) continue;
 
         const similarity = this.calculateSimilarity(f1.content, f2.content);
         
@@ -658,7 +663,11 @@ export class CortexPool {
             WHERE id = ?
           `).run(newConfidence, newImportance, newUseCount, Math.max(f1.lastUsed, f2.lastUsed), f1.id);
 
-          this.db.prepare('DELETE FROM facts WHERE id = ?').run(f2.id);
+          this.deleteFact(f2.id);
+          Object.assign(f1, {
+            confidence: newConfidence, importance: newImportance,
+            useCount: newUseCount, lastUsed: Math.max(f1.lastUsed, f2.lastUsed)
+          });
           merged++;
         }
       }
@@ -669,10 +678,10 @@ export class CortexPool {
 
   private pruneRedundantEdges(): number {
     const facts = this.db.prepare(`
-      SELECT subjectId, predicate, objectId, COUNT(*) as cnt
+      SELECT subjectId, predicate, objectId, content, tier, source, COUNT(*) as cnt
       FROM facts
       WHERE objectId IS NOT NULL
-      GROUP BY subjectId, predicate, objectId
+      GROUP BY subjectId, predicate, objectId, content, tier, source
       HAVING cnt > 1
     `).all() as any[];
     
@@ -682,11 +691,12 @@ export class CortexPool {
       const duplicates = this.db.prepare(`
         SELECT id FROM facts
         WHERE subjectId = ? AND predicate = ? AND objectId = ?
+          AND content = ? AND tier = ? AND source = ?
         ORDER BY importance DESC, useCount DESC
-      `).all(row.subjectId, row.predicate, row.objectId) as any[];
+      `).all(row.subjectId, row.predicate, row.objectId, row.content, row.tier, row.source) as any[];
 
       for (let i = 1; i < duplicates.length; i++) {
-        this.db.prepare('DELETE FROM facts WHERE id = ?').run(duplicates[i].id);
+        this.deleteFact(duplicates[i].id);
         pruned++;
       }
     }
@@ -732,21 +742,32 @@ export class CortexPool {
   }): number {
     const { subject, predicate, object, content, tier = 'semantic', confidence = 0.7, source = 'conversation', ttl } = params;
     
+    if (ttl !== undefined && (!Number.isFinite(ttl) || ttl < 0)) {
+      throw new RangeError('ttl must be a finite, non-negative number of milliseconds');
+    }
     const subjectId = this.addEntity(subject, this.inferType(predicate), confidence);
     let objectId: number | null = null;
     if (object) objectId = this.addEntity(object, 'other', confidence);
     
     let effectiveTtl = ttl;
-    if (tier === 'episodic' && !ttl) {
+    if (tier === 'episodic' && ttl === undefined) {
       effectiveTtl = 7 * 24 * 60 * 60 * 1000;
     }
     
     const result = this.db.prepare(`
       INSERT INTO facts (subjectId, predicate, objectId, content, tier, importance, confidence, source, lastUsed, useCount, createdAt, ttl)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-    `).run(subjectId, predicate, objectId, content, tier, TIER_CONFIG[tier].baseImportance, confidence, source, Date.now(), Date.now(), effectiveTtl || null);
+    `).run(subjectId, predicate, objectId, content, tier, TIER_CONFIG[tier].baseImportance, confidence, source, Date.now(), Date.now(), effectiveTtl ?? null);
     
     return result.lastInsertRowid as number;
+  }
+
+  private deleteFact(id: number): void {
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM pool WHERE factId = ?').run(id);
+      this.db.prepare('DELETE FROM contradictions WHERE fact1Id = ? OR fact2Id = ?').run(id, id);
+      this.db.prepare('DELETE FROM facts WHERE id = ?').run(id);
+    })();
   }
 
   cleanupExpiredEpisodic(): number {
@@ -756,11 +777,11 @@ export class CortexPool {
       SELECT id FROM facts
       WHERE tier = 'episodic'
         AND ttl IS NOT NULL
-        AND createdAt + ttl < ?
+        AND createdAt + ttl <= ?
     `).all(now) as any[];
     
     for (const row of expired) {
-      this.db.prepare('DELETE FROM facts WHERE id = ?').run(row.id);
+      this.deleteFact(row.id);
     }
     
     return expired.length;
@@ -796,7 +817,10 @@ export class CortexPool {
     const byCanonical = this.db.prepare('SELECT * FROM entities WHERE canonicalName = ?').get(normalized) as any;
     if (byCanonical) return this.hydrateEntity(byCanonical);
     
-    const byAlias = this.db.prepare('SELECT * FROM entities WHERE aliases LIKE ?').get(`%${query}%`) as any;
+    const byAlias = this.db.prepare(`
+      SELECT e.* FROM entities e, json_each(e.aliases) alias
+      WHERE lower(trim(alias.value)) = ? LIMIT 1
+    `).get(normalized) as any;
     if (byAlias) return this.hydrateEntity(byAlias);
     
     const fuzzyMatches = this.findFuzzyMatches(query, 0.8);
@@ -821,7 +845,7 @@ export class CortexPool {
   }
 
   getFact(id: number): Fact | null {
-    return this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id) as Fact | null;
+    return (this.db.prepare('SELECT * FROM facts WHERE id = ?').get(id) as Fact | undefined) ?? null;
   }
 
   // ===== Topics & Activation =====
@@ -883,6 +907,7 @@ export class CortexPool {
   retrieve(topics: string[], options: { useVectors?: boolean; poolSize?: number } = {}): Array<Fact & { subject: Entity; object: Entity | null; score: number }> {
     const { poolSize = this.poolSize } = options;
     
+    this.cleanupExpiredEpisodic();
     this.setTopics(topics);
     this.spreadActivation(2, 0.5);
     
@@ -946,7 +971,7 @@ export class CortexPool {
       const newImportance = config.baseImportance + (fact.importance - config.baseImportance) * decay;
       
       if (newImportance < 0.1) {
-        this.db.prepare('DELETE FROM facts WHERE id = ?').run(fact.id);
+        this.deleteFact(fact.id);
       } else {
         this.db.prepare('UPDATE facts SET importance = ? WHERE id = ?').run(newImportance, fact.id);
       }
@@ -981,6 +1006,7 @@ export class CortexPool {
 
   async reflect() {
     const now = Date.now();
+    this.cleanupExpiredEpisodic();
     
     this.applyDecay();
     

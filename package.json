@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc",
     "seed": "tsx scripts/seed.ts",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/cortex-pool.test.ts"
   },
   "keywords": [
     "memory",

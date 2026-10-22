@@ -56,7 +56,20 @@ Combines:
 - Activation spreading for associative recall
 - Reflection loop for memory maintenance
 - Entity resolution with aliases
-- Hybrid retrieval (graph + vectors)
+- Graph retrieval with vector integration scaffolding (not yet functional)
+
+## Development
+
+Use Node.js 22 (CI also covers Node.js 20) on Windows or Linux:
+
+```sh
+npm ci
+npm run build
+npm test
+```
+
+The pinned `better-sqlite3` version has no Windows Node.js 24 prebuilt binary;
+using that runtime may require a local C++ toolchain.
 
 ## Usage
 
@@ -81,13 +94,36 @@ pool.setTopics(['OpenLiam', 'memory']);
 const facts = pool.retrieve(['OpenLiam', 'memory']);
 
 // Mark as used (boosts importance)
-pool.useFact(factId);
+if (facts[0]) pool.useFact(facts[0].id);
 
-// Run reflection (optional maintenance)
-pool.reflect();
+// Run reflection (optional maintenance; inside an async function)
+await pool.reflect();
+pool.close();
 ```
+
+## Memory lifetime and TPC sync
+
+- Episodic facts default to a seven-day TTL, in milliseconds. `ttl: 0` expires
+  immediately; negative or non-finite TTLs are rejected.
+- Retrieval, reflection, and bulk TPC sync remove expired episodic facts,
+  including their pool and contradiction references. Manual cleanup is available
+  through `cleanupExpiredEpisodic()`.
+- Pass an HTTP or HTTPS TPC server URL as the second constructor argument.
+  Requests reject non-2xx responses and time out after 10 seconds of inactivity.
+- `await pool.syncToTPC()` returns `{ synced, failed }` for facts created in the
+  last 24 hours. Direct `syncFactToTPC()` rejects failures; callers must handle
+  them. Repeated syncs can still create duplicate remote thoughts.
+- `fetchFromTPC()` tries `type=thought`, then `type=thoughts` on failure, and
+  returns `[]` if both attempts fail.
+
+## Current limitations
+
+Vector embeddings/search are placeholders: `getEmbedding()` returns random
+values, `searchByVector()` returns no results, and `retrieve()` currently uses
+only graph scoring regardless of `useVectors`. Do not use the embedding output
+for semantic similarity. Old-fact summarization is also a truncation heuristic,
+not an LLM summary. See [REVIEW.md](REVIEW.md) for prioritized follow-up work.
 
 ## Dependencies
 
 - better-sqlite3 (SQLite)
-- LM Studio or similar for vector embeddings (optional)
